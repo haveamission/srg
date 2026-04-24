@@ -1,0 +1,122 @@
+name: Grammar CI/CD
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  GRAMMAR_NAME: srg
+  GRAMMAR_DIR: "."
+  ACE_VERSION: "0.9.34"
+
+jobs:
+  compile-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ACE
+        run: |
+          wget -q http://sweaglesw.org/linguistics/ace/download/ace-${ACE_VERSION}-x86-64.tar.gz
+          tar xzf ace-${ACE_VERSION}-x86-64.tar.gz
+          sudo mv ace-${ACE_VERSION} /opt/ace
+          echo "/opt/ace" >> $GITHUB_PATH
+
+      - name: Install pyDelphin
+        run: pip install pydelphin
+
+      - name: Verify tools
+        run: |
+          ace -V
+          delphin --version
+
+      - name: Compile grammar
+        working-directory: ${{ env.GRAMMAR_DIR }}
+        run: |
+          echo "Compiling ${GRAMMAR_NAME}.dat..."
+          ace -g ace/config.tdl -G ${GRAMMAR_NAME}.dat 2>&1 | tee compile.log
+          if [ ! -f "${GRAMMAR_NAME}.dat" ]; then
+            echo "::error::Compilation failed - no .dat file produced"
+            cat compile.log
+            exit 1
+          fi
+          echo "Compiled successfully:"
+          ls -lh ${GRAMMAR_NAME}.dat
+
+      - name: Parse verification
+        working-directory: ${{ env.GRAMMAR_DIR }}
+        run: |
+          echo "Verifying grammar loads and parses..."
+
+          if [ -d "tsdb/skeletons/mrs" ]; then
+            mkdir -p tsdb/current
+            echo "Creating MRS profile..."
+            rm -rf tsdb/current/mrs
+            delphin mkprof -s tsdb/skeletons/mrs tsdb/current/mrs 2>&1
+
+            echo "Parsing MRS test suite..."
+            delphin process -g ${GRAMMAR_NAME}.dat tsdb/current/mrs 2>&1
+          else
+            echo "No MRS skeleton found, basic load test only"
+            echo "El gato duerme ." | ace -g ${GRAMMAR_NAME}.dat -n 1 2>&1
+          fi
+
+          echo ""
+          echo "Parse verification complete"
+          echo "NOTE: No gold profiles exist for SRG — regression testing not available"
+          echo "Generate gold profiles by running: delphin process -g srg.dat tsdb/current/mrs"
+          echo "Then copy tsdb/current/mrs to tsdb/gold/mrs and commit"
+
+      - name: Upload compiled grammar
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.GRAMMAR_NAME }}-dat
+          path: ${{ env.GRAMMAR_DIR }}/${{ env.GRAMMAR_NAME }}.dat
+          retention-days: 7
+
+  deploy:
+    needs: compile-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Download compiled grammar
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.GRAMMAR_NAME }}-dat
+
+      - name: Backup current grammar
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: root
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script: |
+            cp /mnt/volume_nyc3_01/grammars/${{ env.GRAMMAR_NAME }}.dat /mnt/volume_nyc3_01/grammars/${{ env.GRAMMAR_NAME }}.dat.bak 2>/dev/null || true
+
+      - name: Copy grammar to droplet
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DROPLET_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DROPLET_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+          scp -i ~/.ssh/deploy_key ${{ env.GRAMMAR_NAME }}.dat root@${{ secrets.DROPLET_HOST }}:/mnt/volume_nyc3_01/grammars/
+          rm ~/.ssh/deploy_key
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DROPLET_HOST }}
+          username: root
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          script: |
+            echo "Deployed grammar:"
+            ls -lh /mnt/volume_nyc3_01/grammars/${{ env.GRAMMAR_NAME }}.dat
+            echo "Deployment complete"
